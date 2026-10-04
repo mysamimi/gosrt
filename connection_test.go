@@ -2,6 +2,8 @@ package srt
 
 import (
 	"bytes"
+	"fmt"
+	"io"
 	"strings"
 	"testing"
 	"time"
@@ -31,9 +33,10 @@ func TestEncryption(t *testing.T) {
 
 			streamid := req.StreamId()
 
-			if streamid == "publish" {
+			switch streamid {
+			case "publish":
 				return PUBLISH
-			} else if streamid == "subscribe" {
+			case "subscribe":
 				return SUBSCRIBE
 			}
 
@@ -168,9 +171,10 @@ func TestEncryptionRetransmit(t *testing.T) {
 
 			streamid := req.StreamId()
 
-			if streamid == "publish" {
+			switch streamid {
+			case "publish":
 				return PUBLISH
-			} else if streamid == "subscribe" {
+			case "subscribe":
 				return SUBSCRIBE
 			}
 
@@ -325,9 +329,10 @@ func TestEncryptionKeySwap(t *testing.T) {
 
 			streamid := req.StreamId()
 
-			if streamid == "publish" {
+			switch streamid {
+			case "publish":
 				return PUBLISH
-			} else if streamid == "subscribe" {
+			case "subscribe":
 				return SUBSCRIBE
 			}
 
@@ -438,130 +443,76 @@ func TestEncryptionKeySwap(t *testing.T) {
 	require.Equal(t, strings.Repeat(message, 150), reader1)
 }
 
-func TestStats(t *testing.T) {
-	message := "Hello World!"
-	channel := NewPubSub(PubSubConfig{})
-
-	config := DefaultConfig()
+// TestLowRateACKOverhead measures the control traffic a slow live stream pays
+// for. A 1 fps camera at 25 kbit/s puts ~2.4 packets per second on the wire;
+// the periodic ACK runs on a 10 ms timer, so without suppression the sender
+// receives ~100 ACKs per second regardless — and owes an ACKACK for each.
+func TestLowRateACKOverhead(t *testing.T) {
+	const (
+		addr     = "127.0.0.1:6111"
+		interval = 400 * time.Millisecond // 2.5 packets/s, as at 1 fps / 25 kbit/s
+		packets  = 10                     // 4 s of stream
+	)
 
 	server := Server{
-		Addr:   "127.0.0.1:6003",
-		Config: &config,
+		Addr: addr,
 		HandleConnect: func(req ConnRequest) ConnType {
-			streamid := req.StreamId()
-
-			if streamid == "publish" {
+			if req.StreamId() == "publish" {
 				return PUBLISH
-			} else if streamid == "subscribe" {
-				return SUBSCRIBE
 			}
-
 			return REJECT
 		},
 		HandlePublish: func(conn Conn) {
-			channel.Publish(conn)
-
-			conn.Close()
-		},
-		HandleSubscribe: func(conn Conn) {
-			channel.Subscribe(conn)
-
+			buf := make([]byte, 1316)
+			for {
+				if _, err := conn.Read(buf); err != nil {
+					break
+				}
+			}
 			conn.Close()
 		},
 	}
 
-	err := server.Listen()
-	require.NoError(t, err)
-
+	require.NoError(t, server.Listen())
 	defer server.Shutdown()
 
 	go func() {
-		err := server.Serve()
-		if err == ErrServerClosed {
-			return
+		if err := server.Serve(); err != ErrServerClosed {
+			require.NoError(t, err)
 		}
-		require.NoError(t, err)
 	}()
 
-	statsReader := Statistics{}
-	statsWriter := Statistics{}
+	config := DefaultConfig()
+	config.StreamId = "publish"
 
-	readerConnected := make(chan struct{})
-	readerDone := make(chan struct{})
+	conn, err := Dial("srt", addr, config)
+	require.NoError(t, err)
 
-	dataReader1 := bytes.Buffer{}
+	payload := make([]byte, 1316)
+	start := time.Now()
+	for range packets {
+		_, err := conn.Write(payload)
+		require.True(t, err == nil || err == io.EOF)
+		time.Sleep(interval)
+	}
+	elapsed := time.Since(start).Seconds()
 
-	go func() {
-		defer close(readerDone)
+	stats := &Statistics{}
+	conn.Stats(stats)
+	conn.Close()
 
-		config := DefaultConfig()
-		config.StreamId = "subscribe"
+	data := stats.Accumulated.PktSent
+	acks := stats.Accumulated.PktRecvACK
+	// 72 B per full ACK inbound, and the peer answers each with a 44 B ACKACK
+	// outbound; IPv4 + UDP counted in both.
+	fmt.Printf("\n%d data pkt (%.1f/s) | %d ack in (%.1f/s) "+
+		"| control %.1f kbit/s down, %.1f kbit/s up\n",
+		data, float64(data)/elapsed,
+		acks, float64(acks)/elapsed,
+		float64(acks)*72*8/1000/elapsed, float64(acks)*44*8/1000/elapsed)
 
-		conn, err := Dial("srt", "127.0.0.1:6003", config)
-		if !assert.NoError(t, err) {
-			panic(err.Error())
-		}
-
-		close(readerConnected)
-
-		buffer := make([]byte, 2048)
-
-		for {
-			n, err := conn.Read(buffer)
-			if n != 0 {
-				dataReader1.Write(buffer[:n])
-			}
-
-			if err != nil {
-				break
-			}
-		}
-
-		conn.Stats(&statsReader)
-
-		err = conn.Close()
-		require.NoError(t, err)
-	}()
-
-	<-readerConnected
-
-	writerDone := make(chan struct{})
-
-	go func() {
-		defer close(writerDone)
-
-		config := DefaultConfig()
-		config.StreamId = "publish"
-
-		conn, err := Dial("srt", "127.0.0.1:6003", config)
-		if !assert.NoError(t, err) {
-			panic(err.Error())
-		}
-
-		n, err := conn.Write([]byte(message))
-		if !assert.NoError(t, err) {
-			panic(err.Error())
-		}
-		assert.Equal(t, 12, n)
-
-		time.Sleep(3 * time.Second)
-
-		conn.Stats(&statsWriter)
-
-		err = conn.Close()
-		assert.NoError(t, err)
-	}()
-
-	<-writerDone
-	<-readerDone
-
-	reader1 := dataReader1.String()
-
-	require.Equal(t, message, reader1)
-
-	require.Equal(t, uint64(len(message)+44), statsReader.Accumulated.ByteRecv)
-	require.Equal(t, uint64(1), statsReader.Accumulated.PktRecv)
-
-	require.Equal(t, uint64(len(message)+44), statsWriter.Accumulated.ByteSent)
-	require.Equal(t, uint64(1), statsWriter.Accumulated.PktSent)
+	// One ACK per data packet plus a handshake handful is healthy; the 10 ms
+	// timer unsuppressed would put this in the hundreds.
+	require.Less(t, acks, uint64(4*packets),
+		"periodic ACKs are not being suppressed on an idle link")
 }

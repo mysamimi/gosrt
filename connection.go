@@ -138,6 +138,14 @@ type connStats struct {
 // Check if we implement the net.Conn interface
 var _ net.Conn = &srtConn{}
 
+// ackRecord is a full ACK awaiting its ACKACK: when it was sent, for the RTT
+// estimate, and what it acknowledged, so that a repeat of it can be recognised
+// once the peer confirms it.
+type ackRecord struct {
+	timestamp time.Time
+	seq       circular.Number
+}
+
 type srtConn struct {
 	version  uint32
 	isCaller bool // Only relevant if version == 4
@@ -166,8 +174,16 @@ type srtConn struct {
 	rtt rtt // microseconds
 
 	ackLock       sync.RWMutex
-	ackNumbers    map[uint32]time.Time
+	ackNumbers    map[uint32]ackRecord
 	nextACKNumber circular.Number
+
+	// Bookkeeping for suppressing periodic ACKs that carry no news. See
+	// sendACK.
+	lastSentACK     circular.Number
+	lastSentACKTime time.Time
+	haveSentACK     bool
+	lastACKedACK    circular.Number
+	haveACKedACK    bool
 
 	initialPacketSequenceNumber circular.Number
 
@@ -273,7 +289,7 @@ func newSRTConn(config srtConnConfig) *srtConn {
 	}
 
 	c.nextACKNumber = circular.New(1, packet.MAX_TIMESTAMP)
-	c.ackNumbers = make(map[uint32]time.Time)
+	c.ackNumbers = make(map[uint32]ackRecord)
 
 	c.kmPreAnnounceCountdown = c.config.KMRefreshRate - c.config.KMPreAnnounce
 	c.kmRefreshCountdown = c.config.KMRefreshRate
@@ -879,9 +895,17 @@ func (c *srtConn) handleACKACK(p packet.Packet) {
 	c.log("control:recv:ACKACK:dump", func() string { return p.Dump() })
 
 	// p.typeSpecific is the ACKNumber
-	if ts, ok := c.ackNumbers[p.Header().TypeSpecific]; ok {
+	if ack, ok := c.ackNumbers[p.Header().TypeSpecific]; ok {
 		// 4.10.  Round-Trip Time Estimation
-		c.recalculateRTT(time.Since(ts))
+		c.recalculateRTT(time.Since(ack.timestamp))
+
+		// Remember what the peer has confirmed, so that sendACK can drop a
+		// periodic ACK that would repeat it.
+		if !c.haveACKedACK || ack.seq.Gt(c.lastACKedACK) {
+			c.lastACKedACK = ack.seq
+			c.haveACKedACK = true
+		}
+
 		delete(c.ackNumbers, p.Header().TypeSpecific)
 	} else {
 		c.log("control:recv:ACKACK:error", func() string { return fmt.Sprintf("got unknown ACKACK (%d)", p.Header().TypeSpecific) })
@@ -925,6 +949,11 @@ func (c *srtConn) handleHSRequest(p packet.Packet) {
 	}
 
 	c.log("control:recv:HSReq:cif", func() string { return cif.String() })
+
+	if c.version != 4 {
+		// Ignore such requests if this is not a v4 connection
+		return
+	}
 
 	// Check for version
 	if cif.SRTVersion < 0x010200 || cif.SRTVersion >= 0x010300 {
@@ -988,7 +1017,9 @@ func (c *srtConn) handleHSRequest(p packet.Packet) {
 
 	recvTsbpdDelay := max(cif.SendTSBPDDelay, uint16(c.config.ReceiverLatency.Milliseconds()))
 
+	c.statisticsLock.Lock()
 	c.tsbpdDelay = uint64(recvTsbpdDelay) * 1000
+	c.statisticsLock.Unlock()
 
 	cif.RecvTSBPDDelay = 0
 	cif.SendTSBPDDelay = recvTsbpdDelay
@@ -1017,72 +1048,75 @@ func (c *srtConn) handleHSResponse(p packet.Packet) {
 
 	c.log("control:recv:HSRes:cif", func() string { return cif.String() })
 
-	if c.version == 4 {
-		// Check for version
-		if cif.SRTVersion < 0x010200 || cif.SRTVersion >= 0x010300 {
-			c.log("control:recv:HSRes:error", func() string { return fmt.Sprintf("unsupported version: %#08x", cif.SRTVersion) })
-			c.close()
-			return
-		}
-
-		// TSBPDSND is not relevant from the receiver
-		// PERIODICNAK is the sender's decision, we don't care, but will handle them
-
-		// Check the required SRT flags
-		if !cif.SRTFlags.TSBPDRCV {
-			c.log("control:recv:HSRes:error", func() string { return "TSBPDRCV flag must be set" })
-			c.close()
-
-			return
-		}
-
-		if !cif.SRTFlags.TLPKTDROP {
-			c.log("control:recv:HSRes:error", func() string { return "TLPKTDROP flag must be set" })
-			c.close()
-
-			return
-		}
-
-		if !cif.SRTFlags.CRYPT {
-			c.log("control:recv:HSRes:error", func() string { return "CRYPT flag must be set" })
-			c.close()
-
-			return
-		}
-
-		if !cif.SRTFlags.REXMITFLG {
-			c.log("control:recv:HSRes:error", func() string { return "REXMITFLG flag must be set" })
-			c.close()
-
-			return
-		}
-
-		// These flag was introduced in HSv5 and should not be set in HSv4
-		if cif.SRTFlags.STREAM {
-			c.log("control:recv:HSReq:error", func() string { return "STREAM flag is set" })
-			c.close()
-			return
-		}
-
-		if cif.SRTFlags.PACKET_FILTER && len(c.config.PacketFilter) == 0 {
-			c.log("control:recv:HSRes:error", func() string { return "Peer set PACKET_FILTER but local does not support it" })
-			c.close()
-			return
-		} else if !cif.SRTFlags.PACKET_FILTER && len(c.config.PacketFilter) > 0 {
-			c.log("control:recv:HSRes:error", func() string { return "Local requires PACKET_FILTER but peer did not set it" })
-			c.close()
-			return
-		}
-
-		sendTsbpdDelay := max(cif.SendTSBPDDelay, uint16(c.config.PeerLatency.Milliseconds()))
-
-		c.dropThreshold = max(uint64(float64(sendTsbpdDelay)*1.25)+uint64(c.config.SendDropDelay.Microseconds()), uint64(time.Second.Microseconds()))
-		c.dropThreshold += 20_000
-
-		c.snd.SetDropThreshold(c.dropThreshold)
-
-		c.stopHSRequests()
+	if c.version != 4 {
+		// Ignore such responses if this is not a v4 connection
+		return
 	}
+
+	// Check for version
+	if cif.SRTVersion < 0x010200 || cif.SRTVersion >= 0x010300 {
+		c.log("control:recv:HSRes:error", func() string { return fmt.Sprintf("unsupported version: %#08x", cif.SRTVersion) })
+		c.close()
+		return
+	}
+
+	// TSBPDSND is not relevant from the receiver
+	// PERIODICNAK is the sender's decision, we don't care, but will handle them
+
+	// Check the required SRT flags
+	if !cif.SRTFlags.TSBPDRCV {
+		c.log("control:recv:HSRes:error", func() string { return "TSBPDRCV flag must be set" })
+		c.close()
+
+		return
+	}
+
+	if !cif.SRTFlags.TLPKTDROP {
+		c.log("control:recv:HSRes:error", func() string { return "TLPKTDROP flag must be set" })
+		c.close()
+
+		return
+	}
+
+	if !cif.SRTFlags.CRYPT {
+		c.log("control:recv:HSRes:error", func() string { return "CRYPT flag must be set" })
+		c.close()
+
+		return
+	}
+
+	if !cif.SRTFlags.REXMITFLG {
+		c.log("control:recv:HSRes:error", func() string { return "REXMITFLG flag must be set" })
+		c.close()
+
+		return
+	}
+
+	// These flag was introduced in HSv5 and should not be set in HSv4
+	if cif.SRTFlags.STREAM {
+		c.log("control:recv:HSReq:error", func() string { return "STREAM flag is set" })
+		c.close()
+		return
+	}
+
+	if cif.SRTFlags.PACKET_FILTER && len(c.config.PacketFilter) == 0 {
+		c.log("control:recv:HSRes:error", func() string { return "Peer set PACKET_FILTER but local does not support it" })
+		c.close()
+		return
+	} else if !cif.SRTFlags.PACKET_FILTER && len(c.config.PacketFilter) > 0 {
+		c.log("control:recv:HSRes:error", func() string { return "Local requires PACKET_FILTER but peer did not set it" })
+		c.close()
+		return
+	}
+
+	sendTsbpdDelay := max(cif.SendTSBPDDelay, uint16(c.config.PeerLatency.Milliseconds()))
+
+	c.dropThreshold = max(uint64(float64(sendTsbpdDelay)*1.25)+uint64(c.config.SendDropDelay.Microseconds()), uint64(time.Second.Microseconds()))
+	c.dropThreshold += 20_000
+
+	c.snd.SetDropThreshold(c.dropThreshold)
+
+	c.stopHSRequests()
 }
 
 // handleKMRequest checks if the key material is valid and responds with a KM response.
@@ -1260,8 +1294,17 @@ func (c *srtConn) sendNAK(list []circular.Number) {
 	c.pop(p)
 }
 
-// sendACK sends an ACK to the peer with the given sequence number.
+// sendACK sends an ACK to the peer with the given sequence number. A full ACK
+// that would only repeat what the peer has already confirmed is dropped, see
+// dropRepeatedACK.
 func (c *srtConn) sendACK(seq circular.Number, lite bool) {
+	c.ackLock.Lock()
+	defer c.ackLock.Unlock()
+
+	if !lite && c.dropRepeatedACK(seq) {
+		return
+	}
+
 	p := packet.NewPacket(c.remoteAddr)
 
 	p.Header().IsControlPacket = true
@@ -1272,9 +1315,6 @@ func (c *srtConn) sendACK(seq circular.Number, lite bool) {
 	cif := packet.CIFACK{
 		LastACKPacketSequenceNumber: seq,
 	}
-
-	c.ackLock.Lock()
-	defer c.ackLock.Unlock()
 
 	if lite {
 		cif.IsLite = true
@@ -1292,11 +1332,18 @@ func (c *srtConn) sendACK(seq circular.Number, lite bool) {
 
 		p.Header().TypeSpecific = c.nextACKNumber.Val()
 
-		c.ackNumbers[p.Header().TypeSpecific] = time.Now()
+		c.ackNumbers[p.Header().TypeSpecific] = ackRecord{
+			timestamp: time.Now(),
+			seq:       seq,
+		}
 		c.nextACKNumber = c.nextACKNumber.Inc()
 		if c.nextACKNumber.Val() == 0 {
 			c.nextACKNumber = c.nextACKNumber.Inc()
 		}
+
+		c.lastSentACK = seq
+		c.lastSentACKTime = time.Now()
+		c.haveSentACK = true
 	}
 
 	p.MarshalCIF(&cif)
@@ -1309,6 +1356,38 @@ func (c *srtConn) sendACK(seq circular.Number, lite bool) {
 	c.statisticsLock.Unlock()
 
 	c.pop(p)
+}
+
+// dropRepeatedACK reports whether a full ACK for seq would tell the peer only
+// what it already knows, in which case it is not worth a packet.
+//
+// The periodic ACK is paced by a 10 ms timer rather than by traffic, so a
+// connection carrying a couple of packets per second still produces ~100 ACKs
+// per second. Each is 72 bytes on the wire once IPv4 and UDP are counted, and
+// each obliges the sender to answer with a 44 byte ACKACK. On a low bitrate
+// live link — a 1 fps camera on a cellular or satellite uplink, say — that
+// exchange costs several times what the media does, in both directions.
+//
+// libsrt suppresses the repeats: CUDT::sendCtrlAck() returns early when the
+// sequence number has not advanced since the last ACKACK, and lets the
+// remaining repeats through no more than once per RTT + 4 RTTVar. This is the
+// same rule. Anything that acknowledges new data is always sent.
+//
+// The caller must hold ackLock.
+func (c *srtConn) dropRepeatedACK(seq circular.Number) bool {
+	if !c.haveSentACK || !seq.Equals(c.lastSentACK) {
+		return false // there is something new to acknowledge
+	}
+
+	if c.haveACKedACK && seq.Equals(c.lastACKedACK) {
+		return true // the peer has already confirmed exactly this
+	}
+
+	// Unconfirmed: either the ACK or its ACKACK may have been lost, so keep
+	// repeating — but at the RTT, not at the 10 ms tick.
+	repeatAfter := time.Duration(c.rtt.RTT()+4*c.rtt.RTTVar()) * time.Microsecond
+
+	return time.Since(c.lastSentACKTime) < repeatAfter
 }
 
 // sendACKACK sends an ACKACK to the peer with the given ACK sequence.
@@ -1462,127 +1541,3 @@ func (c *srtConn) log(topic string, message func() string) {
 func (c *srtConn) SetDeadline(t time.Time) error      { return nil }
 func (c *srtConn) SetReadDeadline(t time.Time) error  { return nil }
 func (c *srtConn) SetWriteDeadline(t time.Time) error { return nil }
-
-func (c *srtConn) Stats(s *Statistics) {
-	if s == nil {
-		return
-	}
-
-	now := uint64(time.Since(c.start).Milliseconds())
-
-	send := c.snd.Stats()
-	recv := c.recv.Stats()
-
-	previous := s.Accumulated
-	interval := now - s.MsTimeStamp
-
-	c.statisticsLock.RLock()
-	defer c.statisticsLock.RUnlock()
-
-	// Accumulated
-	s.Accumulated = StatisticsAccumulated{
-		PktSent:           send.Pkt,
-		PktRecv:           recv.Pkt,
-		PktSentUnique:     send.PktUnique,
-		PktRecvUnique:     recv.PktUnique,
-		PktSendLoss:       send.PktLoss,
-		PktRecvLoss:       recv.PktLoss,
-		PktRetrans:        send.PktRetrans,
-		PktRecvRetrans:    recv.PktRetrans,
-		PktSentACK:        c.statistics.pktSentACK,
-		PktRecvACK:        c.statistics.pktRecvACK,
-		PktSentNAK:        c.statistics.pktSentNAK,
-		PktRecvNAK:        c.statistics.pktRecvNAK,
-		PktSentKM:         c.statistics.pktSentKM,
-		PktRecvKM:         c.statistics.pktRecvKM,
-		UsSndDuration:     send.UsSndDuration,
-		PktSendDrop:       send.PktDrop,
-		PktRecvDrop:       recv.PktDrop,
-		PktRecvUndecrypt:  c.statistics.pktRecvUndecrypt,
-		ByteSent:          send.Byte + (send.Pkt * c.statistics.headerSize),
-		ByteRecv:          recv.Byte + (recv.Pkt * c.statistics.headerSize),
-		ByteSentUnique:    send.ByteUnique + (send.PktUnique * c.statistics.headerSize),
-		ByteRecvUnique:    recv.ByteUnique + (recv.PktUnique * c.statistics.headerSize),
-		ByteRecvLoss:      recv.ByteLoss + (recv.PktLoss * c.statistics.headerSize),
-		ByteRetrans:       send.ByteRetrans + (send.PktRetrans * c.statistics.headerSize),
-		ByteRecvRetrans:   recv.ByteRetrans + (recv.PktRetrans * c.statistics.headerSize),
-		ByteSendDrop:      send.ByteDrop + (send.PktDrop * c.statistics.headerSize),
-		ByteRecvDrop:      recv.ByteDrop + (recv.PktDrop * c.statistics.headerSize),
-		ByteRecvUndecrypt: c.statistics.byteRecvUndecrypt + (c.statistics.pktRecvUndecrypt * c.statistics.headerSize),
-	}
-
-	// Interval
-	s.Interval = StatisticsInterval{
-		MsInterval:         interval,
-		PktSent:            s.Accumulated.PktSent - previous.PktSent,
-		PktRecv:            s.Accumulated.PktRecv - previous.PktRecv,
-		PktSentUnique:      s.Accumulated.PktSentUnique - previous.PktSentUnique,
-		PktRecvUnique:      s.Accumulated.PktRecvUnique - previous.PktRecvUnique,
-		PktSendLoss:        s.Accumulated.PktSendLoss - previous.PktSendLoss,
-		PktRecvLoss:        s.Accumulated.PktRecvLoss - previous.PktRecvLoss,
-		PktRetrans:         s.Accumulated.PktRetrans - previous.PktRetrans,
-		PktRecvRetrans:     s.Accumulated.PktRecvRetrans - previous.PktRecvRetrans,
-		PktSentACK:         s.Accumulated.PktSentACK - previous.PktSentACK,
-		PktRecvACK:         s.Accumulated.PktRecvACK - previous.PktRecvACK,
-		PktSentNAK:         s.Accumulated.PktSentNAK - previous.PktSentNAK,
-		PktRecvNAK:         s.Accumulated.PktRecvNAK - previous.PktRecvNAK,
-		MbpsSendRate:       float64(s.Accumulated.ByteSent-previous.ByteSent) * 8 / 1024 / 1024 / (float64(interval) / 1000),
-		MbpsRecvRate:       float64(s.Accumulated.ByteRecv-previous.ByteRecv) * 8 / 1024 / 1024 / (float64(interval) / 1000),
-		UsSndDuration:      s.Accumulated.UsSndDuration - previous.UsSndDuration,
-		PktReorderDistance: 0,
-		PktRecvBelated:     s.Accumulated.PktRecvBelated - previous.PktRecvBelated,
-		PktSndDrop:         s.Accumulated.PktSendDrop - previous.PktSendDrop,
-		PktRecvDrop:        s.Accumulated.PktRecvDrop - previous.PktRecvDrop,
-		PktRecvUndecrypt:   s.Accumulated.PktRecvUndecrypt - previous.PktRecvUndecrypt,
-		ByteSent:           s.Accumulated.ByteSent - previous.ByteSent,
-		ByteRecv:           s.Accumulated.ByteRecv - previous.ByteRecv,
-		ByteSentUnique:     s.Accumulated.ByteSentUnique - previous.ByteSentUnique,
-		ByteRecvUnique:     s.Accumulated.ByteRecvUnique - previous.ByteRecvUnique,
-		ByteRecvLoss:       s.Accumulated.ByteRecvLoss - previous.ByteRecvLoss,
-		ByteRetrans:        s.Accumulated.ByteRetrans - previous.ByteRetrans,
-		ByteRecvRetrans:    s.Accumulated.ByteRecvRetrans - previous.ByteRecvRetrans,
-		ByteRecvBelated:    s.Accumulated.ByteRecvBelated - previous.ByteRecvBelated,
-		ByteSendDrop:       s.Accumulated.ByteSendDrop - previous.ByteSendDrop,
-		ByteRecvDrop:       s.Accumulated.ByteRecvDrop - previous.ByteRecvDrop,
-		ByteRecvUndecrypt:  s.Accumulated.ByteRecvUndecrypt - previous.ByteRecvUndecrypt,
-	}
-
-	// Instantaneous
-	s.Instantaneous = StatisticsInstantaneous{
-		UsPktSendPeriod:       send.UsPktSndPeriod,
-		PktFlowWindow:         uint64(c.config.FC),
-		PktFlightSize:         send.PktFlightSize,
-		MsRTT:                 c.rtt.RTT() / 1000,
-		MbpsSentRate:          send.MbpsEstimatedSentBandwidth,
-		MbpsRecvRate:          recv.MbpsEstimatedRecvBandwidth,
-		MbpsLinkCapacity:      recv.MbpsEstimatedLinkCapacity,
-		ByteAvailSendBuf:      0, // unlimited
-		ByteAvailRecvBuf:      0, // unlimited
-		MbpsMaxBW:             float64(c.config.MaxBW) / 1024 / 1024,
-		ByteMSS:               uint64(c.config.MSS),
-		PktSendBuf:            send.PktBuf,
-		ByteSendBuf:           send.ByteBuf,
-		MsSendBuf:             send.MsBuf,
-		MsSendTsbPdDelay:      c.peerTsbpdDelay / 1000,
-		PktRecvBuf:            recv.PktBuf,
-		ByteRecvBuf:           recv.ByteBuf,
-		MsRecvBuf:             recv.MsBuf,
-		MsRecvTsbPdDelay:      c.tsbpdDelay / 1000,
-		PktReorderTolerance:   uint64(c.config.LossMaxTTL),
-		PktRecvAvgBelatedTime: 0,
-		PktSendLossRate:       send.PktLossRate,
-		PktRecvLossRate:       recv.PktLossRate,
-	}
-
-	// If we're only sending, the receiver congestion control value for the link capacity is zero,
-	// use the value that we got from the receiver via the ACK packets.
-	if s.Instantaneous.MbpsLinkCapacity == 0 {
-		s.Instantaneous.MbpsLinkCapacity = c.statistics.mbpsLinkCapacity
-	}
-
-	if c.config.MaxBW < 0 {
-		s.Instantaneous.MbpsMaxBW = -1
-	}
-
-	s.MsTimeStamp = now
-}
